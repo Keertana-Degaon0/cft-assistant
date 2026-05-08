@@ -37,8 +37,6 @@ export const CONFIG = Object.freeze({
     "Interactive AR museum for cultural heritage",
     "Holographic stage for a product launch",
     "Gamified experiential zone for a mall",
-    "360-degree immersive event for 5000 attendees",
-    "AI-powered booth for corporate trade show",
   ],
   loadingPhases: [
     "Checking feasibility...",

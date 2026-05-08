@@ -1,0 +1,34 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[[redirects]]
+  from = "/api/analyze"
+  to = "/.netlify/functions/analyze"
+  status = 200
+
+[[redirects]]
+  from = "/api/health"
+  to = "/.netlify/functions/health"
+  status = 200
+
+[[redirects]]
+  from = "/api/voice/health"
+  to = "/.netlify/functions/voice-health"
+  status = 200
+
+[[redirects]]
+  from = "/api/voice/transcribe"
+  to = "/.netlify/functions/voice-transcribe"
+  status = 200
+
+[[redirects]]
+  from = "/api/voice/speak"
+  to = "/.netlify/functions/voice-speak"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

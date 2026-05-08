@@ -5,9 +5,12 @@ import {
   analyseIdea,
   buildCopyText,
   getVoiceHealth,
-  speakWithPremiumVoice,
+  speakWithLipSync,
   transcribeVoice,
 } from "./lib/api";
+import { buildLocalAnalysis } from "./lib/localAnalysis";
+import LipSyncAvatar from "./components/LipSyncAvatar";
+import { buildLipSyncTrack, pickVisemeForProgress } from "../shared/lipSync";
 import { matchProjects } from "../shared/projectLibrary";
 import craftechLogo from "./assets/craftech360-logo.jpg";
 
@@ -56,23 +59,59 @@ function buildVoiceSummary(analysis) {
     return "";
   }
 
-  const feasibilityIntro =
-    analysis.badge === "HIGH"
-      ? "This looks highly feasible."
-      : analysis.badge === "MEDIUM"
-        ? "This looks feasible with a few important considerations."
-        : "This idea needs careful planning before moving ahead.";
-
-  const firstFeasibilitySentence = String(analysis.feasibility || "")
-    .split(/(?<=[.!?])\s+/)
-    .filter(Boolean)[0] || "";
+  const normalizeSpeechText = (text) => String(text || "")
+    .replace(/[*•]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   return [
-    `Here is your Craftech 360 voice brief for ${analysis.heading}.`,
-    feasibilityIntro,
-    `Feasibility score is ${analysis.feasibility_score} percent, with technology readiness at ${analysis.tech_score} percent and creative potential at ${analysis.creative_score} percent.`,
-    firstFeasibilitySentence,
+    `Here is your full Craftech 360 voice brief for ${analysis.heading}.`,
+    `Overall feasibility is ${analysis.badge}.`,
+    `Feasibility score is ${analysis.feasibility_score} percent, technology readiness is ${analysis.tech_score} percent, creative potential is ${analysis.creative_score} percent, and audience impact is ${analysis.impact_score} percent.`,
+    `Feasibility analysis. ${normalizeSpeechText(analysis.feasibility)}`,
+    `How it works. ${normalizeSpeechText(analysis.how_it_works)}`,
+    `Challenges and risks. ${normalizeSpeechText(analysis.challenges)}`,
+    `Ideas and enhancements. ${normalizeSpeechText(analysis.ideas)}`,
   ].join(" ");
+}
+
+function base64ToBlob(base64, mimeType) {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new Blob([bytes], { type: mimeType });
+}
+
+function getAvatarTheme(selectedCategory, analysisResult) {
+  const source = (selectedCategory && selectedCategory !== "All"
+    ? selectedCategory
+    : analysisResult?.category || "All").toLowerCase();
+
+  if (source.includes("museum") || source.includes("exhibit")) {
+    return "museum";
+  }
+
+  if (source.includes("experiential")) {
+    return "experiential";
+  }
+
+  if (source.includes("corporate")) {
+    return "corporate";
+  }
+
+  if (source.includes("brand")) {
+    return "brand";
+  }
+
+  if (source.includes("tech") || source.includes("innovation")) {
+    return "tech";
+  }
+
+  return "default";
 }
 
 function App() {
@@ -81,9 +120,11 @@ function App() {
   const mediaStreamRef = useRef(null);
   const audioChunksRef = useRef([]);
   const audioPlayerRef = useRef(null);
+  const audioUrlRef = useRef("");
   const finalTranscriptRef = useRef("");
   const autoSpeakRef = useRef(true);
-  const greetedRef = useRef(false);
+  const voiceCancelRef = useRef(false);
+  const lipSyncFrameRef = useRef(0);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("All");
   const [activePanel, setActivePanel] = useState("feasibility");
@@ -93,10 +134,12 @@ function App() {
   const [phaseIndex, setPhaseIndex] = useState(0);
   const [toast, setToast] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [warningMessage, setWarningMessage] = useState("");
   const [retryAfterSeconds, setRetryAfterSeconds] = useState(0);
   const [voiceStatus, setVoiceStatus] = useState("");
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [avatarViseme, setAvatarViseme] = useState("rest");
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [hasPremiumVoice, setHasPremiumVoice] = useState(false);
 
@@ -190,10 +233,18 @@ function App() {
 
   useEffect(() => {
     return () => {
+      if (lipSyncFrameRef.current) {
+        window.cancelAnimationFrame(lipSyncFrameRef.current);
+      }
+
       recognitionRef.current?.stop?.();
       mediaRecorderRef.current?.stop?.();
       mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
       audioPlayerRef.current?.pause?.();
+
+      if (audioUrlRef.current) {
+        URL.revokeObjectURL(audioUrlRef.current);
+      }
 
       if (hasSpeechSynthesis) {
         window.speechSynthesis.cancel();
@@ -214,7 +265,13 @@ function App() {
     };
   }, [result]);
 
-  const relatedProjects = useMemo(() => matchProjects(query, 6), [query]);
+  const relatedProjects = useMemo(() => matchProjects(query, 4), [query]);
+  const avatarMode = isSpeaking ? "speaking" : isListening ? "listening" : isLoading ? "thinking" : "idle";
+  const avatarTheme = getAvatarTheme(category, result);
+  const showAssistantDock = hasVoiceAssistant;
+  const avatarSubtitle = voiceStatus || (isLoading
+    ? "Analysing your idea and preparing a spoken brief."
+    : "Tap the mic to ask a question and watch the avatar speak.");
 
   async function runAnalysis(overrideQuery = "") {
     if (isLoading) {
@@ -230,6 +287,7 @@ function App() {
     }
 
     setErrorMessage("");
+    setWarningMessage("");
     setRetryAfterSeconds(0);
     setVoiceStatus(overrideQuery ? "Your question was captured. Analysing now..." : "");
     setIsLoading(true);
@@ -261,13 +319,49 @@ function App() {
       }
     } catch (error) {
       console.error("[Craftech360] Analysis error:", error);
-      showError(error);
+      const fallbackResult = buildLocalAnalysis({
+        query: trimmedQuery,
+        category,
+      });
+
+      startTransition(() => {
+        setResult(fallbackResult);
+        setActivePanel("feasibility");
+        setQuery(trimmedQuery);
+        setHistory((current) => {
+          if (current[0]?.query === trimmedQuery) {
+            return current;
+          }
+
+          const nextHistory = [
+            { query: trimmedQuery, category, badge: fallbackResult.badge, result: fallbackResult },
+            ...current,
+          ];
+
+          return nextHistory.slice(0, CONFIG.maxHistory);
+        });
+      });
+
+      setWarningMessage(
+        "Live AI service is unavailable right now, so this result is a local preview analysis."
+      );
+      showError(error, true);
     } finally {
       setIsLoading(false);
     }
   }
 
-  function showError(error) {
+  function handleAnalysisSubmit(event) {
+    event.preventDefault();
+    void runAnalysis();
+  }
+
+  function handleFollowUpSubmit(event) {
+    event.preventDefault();
+    void runAnalysis();
+  }
+
+  function showError(error, keepResultVisible = false) {
     let message = "Something went wrong. Please try again.";
 
     if (error instanceof APIError) {
@@ -286,7 +380,7 @@ function App() {
       message = "No internet connection. Please check your network and try again.";
     }
 
-    setErrorMessage(message);
+    setErrorMessage(keepResultVisible ? "" : message);
     setRetryAfterSeconds(
       error instanceof APIError && Number(error.raw?.retryAfterSeconds) > 0
         ? Number(error.raw.retryAfterSeconds)
@@ -295,15 +389,65 @@ function App() {
     setVoiceStatus("");
   }
 
+  function stopLipSyncAnimation() {
+    if (lipSyncFrameRef.current) {
+      window.cancelAnimationFrame(lipSyncFrameRef.current);
+      lipSyncFrameRef.current = 0;
+    }
+
+    setAvatarViseme("rest");
+  }
+
+  function startLipSyncAnimation({ cues, estimatedDurationMs, getProgress }) {
+    stopLipSyncAnimation();
+
+    const fallbackDurationMs = Math.max(estimatedDurationMs || 1, 1);
+
+    const tick = () => {
+      const progress = getProgress(fallbackDurationMs);
+      setAvatarViseme(pickVisemeForProgress(cues, progress));
+
+      if (progress >= 1) {
+        stopLipSyncAnimation();
+        return;
+      }
+
+      lipSyncFrameRef.current = window.requestAnimationFrame(tick);
+    };
+
+    lipSyncFrameRef.current = window.requestAnimationFrame(tick);
+  }
+
   function stopSpeaking() {
     audioPlayerRef.current?.pause?.();
     audioPlayerRef.current = null;
+
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+      audioUrlRef.current = "";
+    }
 
     if (hasSpeechSynthesis) {
       window.speechSynthesis.cancel();
     }
 
+    stopLipSyncAnimation();
     setIsSpeaking(false);
+    setVoiceStatus("");
+  }
+
+  function cancelVoiceAssistant() {
+    voiceCancelRef.current = true;
+    stopSpeaking();
+    recognitionRef.current?.stop?.();
+    mediaRecorderRef.current?.stop?.();
+    mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    recognitionRef.current = null;
+    audioChunksRef.current = [];
+    finalTranscriptRef.current = "";
+    setIsListening(false);
     setVoiceStatus("");
   }
 
@@ -317,37 +461,66 @@ function App() {
 
     if (hasPremiumVoice) {
       try {
-        await new Promise(async (resolve) => {
-          const audioBlob = await speakWithPremiumVoice(text);
+        const lipSync = await speakWithLipSync(text);
+
+        await new Promise((resolve) => {
+          const audioBlob = base64ToBlob(lipSync.audioBase64, lipSync.mimeType || "audio/mpeg");
           const audioUrl = URL.createObjectURL(audioBlob);
           const audio = new Audio(audioUrl);
 
+          audioUrlRef.current = audioUrl;
           audioPlayerRef.current = audio;
           audio.onplay = () => {
             setIsSpeaking(true);
             setVoiceStatus("Craftech AI is speaking...");
+            startLipSyncAnimation({
+              cues: lipSync.cues,
+              estimatedDurationMs: lipSync.estimatedDurationMs,
+              getProgress: (fallbackDurationMs) => {
+                const durationMs = Number.isFinite(audio.duration) && audio.duration > 0
+                  ? audio.duration * 1000
+                  : fallbackDurationMs;
+
+                return (audio.currentTime * 1000) / durationMs;
+              },
+            });
           };
           audio.onended = () => {
+            stopLipSyncAnimation();
             setIsSpeaking(false);
             setVoiceStatus("");
             audioPlayerRef.current = null;
+            if (audioUrlRef.current) {
+              URL.revokeObjectURL(audioUrlRef.current);
+              audioUrlRef.current = "";
+            }
             resolve();
           };
           audio.onerror = () => {
+            stopLipSyncAnimation();
             setIsSpeaking(false);
             setVoiceStatus("Premium voice playback was interrupted.");
             audioPlayerRef.current = null;
+            if (audioUrlRef.current) {
+              URL.revokeObjectURL(audioUrlRef.current);
+              audioUrlRef.current = "";
+            }
             resolve();
           };
 
-          try {
-            await audio.play();
-            premiumPlaybackWorked = true;
-          } catch {
-            setErrorMessage("Voice playback was blocked by the browser. Please use Chrome or Edge and allow site audio.");
-            URL.revokeObjectURL(audioUrl);
-            resolve();
-          }
+          audio.play()
+            .then(() => {
+              premiumPlaybackWorked = true;
+            })
+            .catch(() => {
+              setErrorMessage("Voice playback was blocked by the browser. Please use Chrome or Edge and allow site audio.");
+              audioPlayerRef.current = null;
+              if (audioUrlRef.current) {
+                URL.revokeObjectURL(audioUrlRef.current);
+                audioUrlRef.current = "";
+              }
+              resolve();
+            });
         });
         if (premiumPlaybackWorked) {
           return;
@@ -362,21 +535,32 @@ function App() {
       return;
     }
 
+    const lipSync = buildLipSyncTrack(text);
     await new Promise((resolve) => {
       const utterance = new window.SpeechSynthesisUtterance(text);
       utterance.rate = 1;
       utterance.pitch = 1.02;
       utterance.volume = 1;
+      let speechStartTime = 0;
+
       utterance.onstart = () => {
+        speechStartTime = performance.now();
         setIsSpeaking(true);
         setVoiceStatus("Craftech AI is speaking...");
+        startLipSyncAnimation({
+          cues: lipSync.cues,
+          estimatedDurationMs: lipSync.estimatedDurationMs,
+          getProgress: (fallbackDurationMs) => (performance.now() - speechStartTime) / fallbackDurationMs,
+        });
       };
       utterance.onend = () => {
+        stopLipSyncAnimation();
         setIsSpeaking(false);
         setVoiceStatus("");
         resolve();
       };
       utterance.onerror = () => {
+        stopLipSyncAnimation();
         setIsSpeaking(false);
         setVoiceStatus("Voice playback was interrupted.");
         resolve();
@@ -397,6 +581,7 @@ function App() {
   }
 
   function stopVoiceCapture() {
+    voiceCancelRef.current = false;
     recognitionRef.current?.stop?.();
     mediaRecorderRef.current?.stop?.();
     mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
@@ -421,6 +606,7 @@ function App() {
       return false;
     }
 
+    voiceCancelRef.current = false;
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
     const recorder = new MediaRecorder(stream, { mimeType });
@@ -452,6 +638,13 @@ function App() {
       mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
       mediaStreamRef.current = null;
       mediaRecorderRef.current = null;
+
+      if (voiceCancelRef.current) {
+        voiceCancelRef.current = false;
+        audioChunksRef.current = [];
+        setVoiceStatus("");
+        return;
+      }
 
       const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
       audioChunksRef.current = [];
@@ -496,6 +689,7 @@ function App() {
       return;
     }
 
+    voiceCancelRef.current = false;
     stopSpeaking();
     finalTranscriptRef.current = "";
 
@@ -548,9 +742,16 @@ function App() {
       setIsListening(false);
       recognitionRef.current = null;
 
+      if (voiceCancelRef.current) {
+        voiceCancelRef.current = false;
+        finalTranscriptRef.current = "";
+        setVoiceStatus("");
+        return;
+      }
+
       if (spokenQuery) {
         setVoiceStatus("Voice captured. Sending your request...");
-        runAnalysis(spokenQuery);
+        void runAnalysis(spokenQuery);
       } else {
         setVoiceStatus("");
       }
@@ -559,10 +760,9 @@ function App() {
     recognition.start();
   }
 
-  async function startVoiceAssistant() {
+  async function startVoiceCapture() {
     setErrorMessage("");
-    greetedRef.current = true;
-    setVoiceStatus("Hi, how can I help with your idea today?");
+    stopSpeaking();
 
     if (hasPremiumVoice) {
       try {
@@ -588,7 +788,7 @@ function App() {
       return;
     }
 
-    startVoiceAssistant();
+    void startVoiceCapture();
   }
 
   function replayVoiceSummary() {
@@ -654,6 +854,8 @@ function App() {
     setQuery("");
     setResult(null);
     setActivePanel("feasibility");
+    setErrorMessage("");
+    setWarningMessage("");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -716,6 +918,22 @@ function App() {
       </section>
 
       <main className="main" id="mainContent">
+        <div className="main-layout">
+          {showAssistantDock && (
+            <aside className="assistant-sidebar" aria-hidden="true">
+              <div className={`assistant-sidebar__inner ${isSpeaking ? "assistant-sidebar__inner--speaking" : ""}`}>
+                <LipSyncAvatar
+                  mode={avatarMode}
+                  viseme={avatarViseme}
+                  subtitle={avatarSubtitle}
+                  theme={avatarTheme}
+                  compact
+                />
+              </div>
+            </aside>
+          )}
+
+          <div className="main-content">
         <div className="card input-card" id="inputCard">
           <div className="card__stripe" aria-hidden="true"></div>
 
@@ -751,7 +969,30 @@ function App() {
               </button>
             </div>
           )}
-          <div className="search-action-group">
+          {warningMessage && (
+            <div className="status-banner" role="status" aria-live="polite">
+              <div>
+                <strong>Preview mode.</strong> {warningMessage}
+              </div>
+            </div>
+          )}
+          {voiceStatus && (
+            <div className="status-banner" role="status" aria-live="polite">
+              <div>
+                <strong>Voice assistant.</strong> {voiceStatus}
+              </div>
+              {isListening && (
+                <button
+                  className="status-banner__action"
+                  type="button"
+                  onClick={stopVoiceCapture}
+                >
+                  Stop
+                </button>
+              )}
+            </div>
+          )}
+          <form className="search-action-group" onSubmit={handleAnalysisSubmit}>
             <div className="textarea-wrap">
               <textarea
                 id="userQuery"
@@ -759,11 +1000,16 @@ function App() {
                 placeholder="e.g. Can we create an AR museum exhibit for a heritage brand in Mumbai? What would it take and is it feasible?"
                 aria-describedby="charCount"
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                onChange={(event) => {
+                  setQuery(event.target.value);
+                  if (errorMessage) {
+                    setErrorMessage("");
+                  }
+                }}
                 onKeyDown={(event) => {
                   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
                     event.preventDefault();
-                    runAnalysis();
+                    void runAnalysis();
                   }
                 }}
               />
@@ -775,9 +1021,8 @@ function App() {
             <button
               className="submit-btn"
               id="submitBtn"
-              type="button"
+              type="submit"
               aria-label="Analyse feasibility and ideas"
-              onClick={runAnalysis}
               disabled={isLoading}
             >
               <span className="submit-btn__icon" aria-hidden="true">
@@ -786,7 +1031,7 @@ function App() {
               Analyse Feasibility &amp; Ideas
               <span className="submit-btn__hint">Ctrl+Enter</span>
             </button>
-          </div>
+          </form>
 
           <span className="examples-label">Try an example -&gt;</span>
           <div className="chip-group" role="list" aria-label="Example prompts">
@@ -924,6 +1169,53 @@ function App() {
                 Share
               </button>
             </div>
+
+            <div className="follow-up-card card" aria-label="Ask a follow-up question">
+              <div className="follow-up-card__header">
+                <h3 className="follow-up-card__title">Ask The Robot Anything Else</h3>
+                <p className="follow-up-card__meta">
+                  Continue with doubts, feasibility questions, budget ideas, or implementation details.
+                </p>
+              </div>
+              <form className="follow-up-form" onSubmit={handleFollowUpSubmit}>
+                <div className="follow-up-form__field">
+                  <textarea
+                    id="followUpQuery"
+                    maxLength={600}
+                    placeholder={`Ask a follow-up about ${result.heading}, execution, cost, risks, or next steps...`}
+                    value={query}
+                    onChange={(event) => {
+                      setQuery(event.target.value);
+                      if (errorMessage) {
+                        setErrorMessage("");
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                        event.preventDefault();
+                        void runAnalysis();
+                      }
+                    }}
+                  />
+                </div>
+                <div className="follow-up-form__actions">
+                  <button
+                    className="action-btn action-btn--primary"
+                    type="submit"
+                    disabled={isLoading}
+                  >
+                    Ask Robot
+                  </button>
+                  <button
+                    className={`action-btn ${isListening ? "action-btn--active" : ""}`}
+                    type="button"
+                    onClick={toggleVoiceAssistant}
+                  >
+                    {isListening ? "Stop Listening" : "Ask By Voice"}
+                  </button>
+                </div>
+              </form>
+            </div>
           </section>
         )}
 
@@ -957,6 +1249,8 @@ function App() {
             </ul>
           </aside>
         )}
+          </div>
+        </div>
       </main>
 
       <footer className="footer">

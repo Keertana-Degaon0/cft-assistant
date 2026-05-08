@@ -1,23 +1,5 @@
-import dotenv from "dotenv";
-import express from "express";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { buildProjectContext } from "../shared/projectLibrary.js";
-import { buildLipSyncTrack } from "../shared/lipSync.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-dotenv.config({
-  path: path.resolve(__dirname, "..", ".env"),
-});
-
-const app = express();
-const port = Number(process.env.PORT || 3001);
-const distPath = path.resolve(__dirname, "..", "dist");
-
-app.use(express.json({ limit: "1mb" }));
+import { buildProjectContext } from "../../shared/projectLibrary.js";
+import { buildLipSyncTrack } from "../../shared/lipSync.js";
 
 function buildSystemPrompt() {
   return `
@@ -128,11 +110,7 @@ function parseModelResponse(data) {
       throw new Error("Could not parse JSON from API response.");
     }
 
-    try {
-      parsed = JSON.parse(extracted);
-    } catch {
-      throw new Error("Could not parse JSON from API response.");
-    }
+    parsed = JSON.parse(extracted);
   }
 
   return validateResult(parsed);
@@ -171,14 +149,8 @@ async function requestGroq({ apiKey, userMessage }) {
         temperature: 0.2,
         max_tokens: 1500,
         messages: [
-          {
-            role: "system",
-            content: buildSystemPrompt(),
-          },
-          {
-            role: "user",
-            content: userMessage,
-          },
+          { role: "system", content: buildSystemPrompt() },
+          { role: "user", content: userMessage },
         ],
       }),
     });
@@ -203,30 +175,18 @@ async function requestGroq({ apiKey, userMessage }) {
   throw new Error("Groq request retry loop ended unexpectedly.");
 }
 
-app.get("/api/health", (_req, res) => {
-  res.json({
-    ok: true,
-    hasApiKey: Boolean(process.env.GROQ_API_KEY),
-    hasPremiumVoice: Boolean(process.env.OPENAI_API_KEY),
-  });
-});
-
-app.post("/api/analyze", async (req, res) => {
+export async function analyzeIdea(payload) {
   const apiKey = process.env.GROQ_API_KEY;
 
   if (!apiKey) {
-    return res.status(500).json({
-      error: "Missing GROQ_API_KEY in server environment.",
-    });
+    return { statusCode: 500, body: { error: "Missing GROQ_API_KEY in server environment." } };
   }
 
-  const query = String(req.body?.query || "").trim();
-  const category = String(req.body?.category || "All");
+  const query = String(payload?.query || "").trim();
+  const category = String(payload?.category || "All");
 
   if (!query) {
-    return res.status(400).json({
-      error: "Query cannot be empty.",
-    });
+    return { statusCode: 400, body: { error: "Query cannot be empty." } };
   }
 
   const userMessage = [
@@ -251,60 +211,61 @@ app.post("/api/analyze", async (req, res) => {
         const groqError = parsedError?.error;
 
         if (groqError?.code === "json_validate_failed") {
-          providerMessage =
-            "Groq returned an invalid structured response. Please try again.";
+          providerMessage = "Groq returned an invalid structured response. Please try again.";
         } else if (typeof groqError?.message === "string" && groqError.message.trim()) {
           providerMessage = `Groq request failed: ${groqError.message}`;
         }
       } catch {
-        // Keep the raw fallback message when the provider error is not JSON.
+        // Keep raw fallback.
       }
 
-      return res.status(response.status).json({
-        error:
-          response.status === 429
-            ? `Groq is receiving too many requests right now.${retryAfter ? ` Please retry in about ${retryAfter} seconds.` : " Please wait a moment and try again."}`
-            : providerMessage,
-        retryAfterSeconds:
-          response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0
-            ? retryAfter
-            : null,
-      });
+      return {
+        statusCode: response.status,
+        body: {
+          error:
+            response.status === 429
+              ? `Groq is receiving too many requests right now.${retryAfter ? ` Please retry in about ${retryAfter} seconds.` : " Please wait a moment and try again."}`
+              : providerMessage,
+          retryAfterSeconds:
+            response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0
+              ? retryAfter
+              : null,
+        },
+      };
     }
 
     const data = await response.json();
-    const result = parseModelResponse(data);
-    return res.json(result);
+    return { statusCode: 200, body: parseModelResponse(data) };
   } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : "Unknown server error.",
-    });
+    return {
+      statusCode: 500,
+      body: { error: error instanceof Error ? error.message : "Unknown server error." },
+    };
   }
-});
+}
 
-app.get("/api/voice/health", (_req, res) => {
-  res.json({
-    ok: true,
-    hasPremiumVoice: Boolean(process.env.OPENAI_API_KEY),
-  });
-});
+export function voiceHealth() {
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      hasPremiumVoice: Boolean(process.env.OPENAI_API_KEY),
+    },
+  };
+}
 
-app.post("/api/voice/transcribe", async (req, res) => {
+export async function transcribeAudio(payload) {
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
-    return res.status(503).json({
-      error: "Premium voice transcription is not configured on the server.",
-    });
+    return { statusCode: 503, body: { error: "Premium voice transcription is not configured on the server." } };
   }
 
-  const audioBase64 = String(req.body?.audioBase64 || "");
-  const mimeType = String(req.body?.mimeType || "audio/webm");
+  const audioBase64 = String(payload?.audioBase64 || "");
+  const mimeType = String(payload?.mimeType || "audio/webm");
 
   if (!audioBase64) {
-    return res.status(400).json({
-      error: "Audio payload is required.",
-    });
+    return { statusCode: 400, body: { error: "Audio payload is required." } };
   }
 
   try {
@@ -312,55 +273,45 @@ app.post("/api/voice/transcribe", async (req, res) => {
     const formData = new FormData();
     const extension = mimeType.includes("wav") ? "wav" : "webm";
 
-    formData.append(
-      "file",
-      new Blob([buffer], { type: mimeType }),
-      `voice-input.${extension}`
-    );
+    formData.append("file", new Blob([buffer], { type: mimeType }), `voice-input.${extension}`);
     formData.append("model", "gpt-4o-mini-transcribe");
     formData.append("language", "en");
 
     const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-      },
+      headers: { authorization: `Bearer ${apiKey}` },
       body: formData,
     });
 
     if (!response.ok) {
       const errorBody = await response.text();
-      return res.status(response.status).json({
-        error: getJsonErrorMessage(errorBody, "Premium transcription failed."),
-      });
+      return {
+        statusCode: response.status,
+        body: { error: getJsonErrorMessage(errorBody, "Premium transcription failed.") },
+      };
     }
 
     const data = await response.json();
-    return res.json({
-      text: String(data?.text || "").trim(),
-    });
+    return { statusCode: 200, body: { text: String(data?.text || "").trim() } };
   } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : "Unknown transcription error.",
-    });
+    return {
+      statusCode: 500,
+      body: { error: error instanceof Error ? error.message : "Unknown transcription error." },
+    };
   }
-});
+}
 
-app.post("/api/voice/speak", async (req, res) => {
+export async function generateSpeech(payload) {
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
-    return res.status(503).json({
-      error: "Premium voice playback is not configured on the server.",
-    });
+    return { statusCode: 503, body: { error: "Premium voice playback is not configured on the server." } };
   }
 
-  const text = String(req.body?.text || "").trim();
+  const text = String(payload?.text || "").trim();
 
   if (!text) {
-    return res.status(400).json({
-      error: "Text is required for speech generation.",
-    });
+    return { statusCode: 400, body: { error: "Text is required for speech generation." } };
   }
 
   try {
@@ -381,37 +332,41 @@ app.post("/api/voice/speak", async (req, res) => {
 
     if (!response.ok) {
       const errorBody = await response.text();
-      return res.status(response.status).json({
-        error: getJsonErrorMessage(errorBody, "Premium speech generation failed."),
-      });
+      return {
+        statusCode: response.status,
+        body: { error: getJsonErrorMessage(errorBody, "Premium speech generation failed.") },
+      };
     }
 
     const audioBuffer = Buffer.from(await response.arrayBuffer());
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-    return res.send(audioBuffer);
+    return {
+      statusCode: 200,
+      isBinary: true,
+      body: audioBuffer.toString("base64"),
+      headers: {
+        "Content-Type": "audio/mpeg",
+        "Cache-Control": "no-store",
+      },
+    };
   } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : "Unknown speech generation error.",
-    });
+    return {
+      statusCode: 500,
+      body: { error: error instanceof Error ? error.message : "Unknown speech generation error." },
+    };
   }
-});
+}
 
-app.post("/api/voice/lipsync", async (req, res) => {
+export async function generateLipSyncSpeech(payload) {
   const apiKey = process.env.OPENAI_API_KEY;
 
   if (!apiKey) {
-    return res.status(503).json({
-      error: "Premium voice playback is not configured on the server.",
-    });
+    return { statusCode: 503, body: { error: "Premium voice playback is not configured on the server." } };
   }
 
-  const text = String(req.body?.text || "").trim();
+  const text = String(payload?.text || "").trim();
 
   if (!text) {
-    return res.status(400).json({
-      error: "Text is required for lip sync generation.",
-    });
+    return { statusCode: 400, body: { error: "Text is required for lip sync generation." } };
   }
 
   try {
@@ -432,39 +387,28 @@ app.post("/api/voice/lipsync", async (req, res) => {
 
     if (!response.ok) {
       const errorBody = await response.text();
-      return res.status(response.status).json({
-        error: getJsonErrorMessage(errorBody, "Premium lip sync generation failed."),
-      });
+      return {
+        statusCode: response.status,
+        body: { error: getJsonErrorMessage(errorBody, "Premium lip sync generation failed.") },
+      };
     }
 
     const audioBuffer = Buffer.from(await response.arrayBuffer());
     const lipSync = buildLipSyncTrack(text);
 
-    return res.json({
-      audioBase64: audioBuffer.toString("base64"),
-      mimeType: "audio/mpeg",
-      estimatedDurationMs: lipSync.estimatedDurationMs,
-      cues: lipSync.cues,
-    });
+    return {
+      statusCode: 200,
+      body: {
+        audioBase64: audioBuffer.toString("base64"),
+        mimeType: "audio/mpeg",
+        estimatedDurationMs: lipSync.estimatedDurationMs,
+        cues: lipSync.cues,
+      },
+    };
   } catch (error) {
-    return res.status(500).json({
-      error: error instanceof Error ? error.message : "Unknown lip sync generation error.",
-    });
+    return {
+      statusCode: 500,
+      body: { error: error instanceof Error ? error.message : "Unknown lip sync generation error." },
+    };
   }
-});
-
-if (fs.existsSync(distPath)) {
-  app.use(express.static(distPath));
-
-  app.get("/{*splat}", (req, res, next) => {
-    if (req.path.startsWith("/api/")) {
-      return next();
-    }
-
-    return res.sendFile(path.join(distPath, "index.html"));
-  });
 }
-
-app.listen(port, () => {
-  console.log(`Craftech backend running on http://localhost:${port}`);
-});
