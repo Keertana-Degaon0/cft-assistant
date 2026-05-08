@@ -125,6 +125,8 @@ function App() {
   const autoSpeakRef = useRef(true);
   const voiceCancelRef = useRef(false);
   const lipSyncFrameRef = useRef(0);
+  const speechWatchdogRef = useRef(0);
+  const speechPollRef = useRef(0);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("All");
   const [activePanel, setActivePanel] = useState("feasibility");
@@ -233,6 +235,14 @@ function App() {
 
   useEffect(() => {
     return () => {
+      if (speechWatchdogRef.current) {
+        window.clearTimeout(speechWatchdogRef.current);
+      }
+
+      if (speechPollRef.current) {
+        window.clearInterval(speechPollRef.current);
+      }
+
       if (lipSyncFrameRef.current) {
         window.cancelAnimationFrame(lipSyncFrameRef.current);
       }
@@ -277,6 +287,8 @@ function App() {
     if (isLoading) {
       return;
     }
+
+    stopSpeaking();
 
     const trimmedQuery = (overrideQuery || query).trim();
     if (!trimmedQuery) {
@@ -398,6 +410,42 @@ function App() {
     setAvatarViseme("rest");
   }
 
+  function clearSpeechWatchdog() {
+    if (speechWatchdogRef.current) {
+      window.clearTimeout(speechWatchdogRef.current);
+      speechWatchdogRef.current = 0;
+    }
+
+    if (speechPollRef.current) {
+      window.clearInterval(speechPollRef.current);
+      speechPollRef.current = 0;
+    }
+  }
+
+  function finishSpeaking(nextStatus = "") {
+    clearSpeechWatchdog();
+    stopLipSyncAnimation();
+    setIsSpeaking(false);
+    setVoiceStatus(nextStatus);
+  }
+
+  function startSpeechWatchdog(expectedDurationMs) {
+    clearSpeechWatchdog();
+
+    const safeDurationMs = Math.max(Number(expectedDurationMs) || 0, 1500);
+    speechWatchdogRef.current = window.setTimeout(() => {
+      finishSpeaking("");
+    }, safeDurationMs + 1800);
+
+    if (hasSpeechSynthesis) {
+      speechPollRef.current = window.setInterval(() => {
+        if (!window.speechSynthesis.speaking && !window.speechSynthesis.pending) {
+          finishSpeaking("");
+        }
+      }, 400);
+    }
+  }
+
   function startLipSyncAnimation({ cues, estimatedDurationMs, getProgress }) {
     stopLipSyncAnimation();
 
@@ -419,6 +467,7 @@ function App() {
   }
 
   function stopSpeaking() {
+    clearSpeechWatchdog();
     audioPlayerRef.current?.pause?.();
     audioPlayerRef.current = null;
 
@@ -431,9 +480,7 @@ function App() {
       window.speechSynthesis.cancel();
     }
 
-    stopLipSyncAnimation();
-    setIsSpeaking(false);
-    setVoiceStatus("");
+    finishSpeaking("");
   }
 
   function cancelVoiceAssistant() {
@@ -484,11 +531,10 @@ function App() {
                 return (audio.currentTime * 1000) / durationMs;
               },
             });
+            startSpeechWatchdog(lipSync.estimatedDurationMs);
           };
           audio.onended = () => {
-            stopLipSyncAnimation();
-            setIsSpeaking(false);
-            setVoiceStatus("");
+            finishSpeaking("");
             audioPlayerRef.current = null;
             if (audioUrlRef.current) {
               URL.revokeObjectURL(audioUrlRef.current);
@@ -497,9 +543,7 @@ function App() {
             resolve();
           };
           audio.onerror = () => {
-            stopLipSyncAnimation();
-            setIsSpeaking(false);
-            setVoiceStatus("Premium voice playback was interrupted.");
+            finishSpeaking("Premium voice playback was interrupted.");
             audioPlayerRef.current = null;
             if (audioUrlRef.current) {
               URL.revokeObjectURL(audioUrlRef.current);
@@ -511,13 +555,16 @@ function App() {
           audio.play()
             .then(() => {
               premiumPlaybackWorked = true;
+              setErrorMessage("");
             })
             .catch(() => {
-              setErrorMessage("Voice playback was blocked by the browser. Please use Chrome or Edge and allow site audio.");
               audioPlayerRef.current = null;
               if (audioUrlRef.current) {
                 URL.revokeObjectURL(audioUrlRef.current);
                 audioUrlRef.current = "";
+              }
+              if (!hasSpeechSynthesis) {
+                setErrorMessage("Voice playback was blocked by the browser. Please allow site audio and try again.");
               }
               resolve();
             });
@@ -552,17 +599,14 @@ function App() {
           estimatedDurationMs: lipSync.estimatedDurationMs,
           getProgress: (fallbackDurationMs) => (performance.now() - speechStartTime) / fallbackDurationMs,
         });
+        startSpeechWatchdog(lipSync.estimatedDurationMs);
       };
       utterance.onend = () => {
-        stopLipSyncAnimation();
-        setIsSpeaking(false);
-        setVoiceStatus("");
+        finishSpeaking("");
         resolve();
       };
       utterance.onerror = () => {
-        stopLipSyncAnimation();
-        setIsSpeaking(false);
-        setVoiceStatus("Voice playback was interrupted.");
+        finishSpeaking("Voice playback was interrupted.");
         resolve();
       };
 
@@ -576,7 +620,10 @@ function App() {
         utterance.voice = preferredVoice;
       }
 
-      window.speechSynthesis.speak(utterance);
+      window.speechSynthesis.cancel();
+      window.setTimeout(() => {
+        window.speechSynthesis.speak(utterance);
+      }, 60);
     });
   }
 
