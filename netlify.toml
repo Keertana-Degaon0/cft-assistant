@@ -29,6 +29,11 @@
   status = 200
 
 [[redirects]]
+  from = "/api/voice/lipsync"
+  to = "/.netlify/functions/voice-lipsync"
+  status = 200
+
+[[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
