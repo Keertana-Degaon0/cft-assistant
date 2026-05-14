@@ -11,7 +11,6 @@ import {
 import { buildLocalAnalysis } from "./lib/localAnalysis";
 import LipSyncAvatar from "./components/LipSyncAvatar";
 import { buildLipSyncTrack, pickVisemeForProgress } from "../shared/lipSync";
-import { matchProjects } from "../shared/projectLibrary";
 import craftechLogo from "./assets/craftech360-logo.jpg";
 
 const PANELS = [
@@ -122,8 +121,12 @@ function App() {
   const audioPlayerRef = useRef(null);
   const audioUrlRef = useRef("");
   const finalTranscriptRef = useRef("");
+  const spokenQueryRef = useRef("");
   const autoSpeakRef = useRef(true);
   const voiceCancelRef = useRef(false);
+  const recognitionErrorRef = useRef(false);
+  const voiceFallbackAttemptedRef = useRef(false);
+  const voiceSessionIdRef = useRef(0);
   const lipSyncFrameRef = useRef(0);
   const speechWatchdogRef = useRef(0);
   const speechPollRef = useRef(0);
@@ -152,7 +155,11 @@ function App() {
   const hasSpeechRecognition = Boolean(SpeechRecognition);
   const hasSpeechSynthesis =
     typeof window !== "undefined" && "speechSynthesis" in window && "SpeechSynthesisUtterance" in window;
-  const hasVoiceAssistant = hasPremiumVoice || hasSpeechRecognition || hasSpeechSynthesis;
+  const canRecordAudio =
+    typeof window !== "undefined" &&
+    Boolean(navigator.mediaDevices?.getUserMedia) &&
+    typeof MediaRecorder !== "undefined";
+  const hasVoiceAssistant = hasSpeechRecognition || canRecordAudio || hasSpeechSynthesis;
 
   useEffect(() => {
     if (!isLoading) {
@@ -275,13 +282,13 @@ function App() {
     };
   }, [result]);
 
-  const relatedProjects = useMemo(() => matchProjects(query, 4), [query]);
   const avatarMode = isSpeaking ? "speaking" : isListening ? "listening" : isLoading ? "thinking" : "idle";
   const avatarTheme = getAvatarTheme(category, result);
-  const showAssistantDock = hasVoiceAssistant;
   const avatarSubtitle = voiceStatus || (isLoading
     ? "Analysing your idea and preparing a spoken brief."
     : "Tap the mic to ask a question and watch the avatar speak.");
+  const showcaseExamples = CONFIG.examples.slice(0, 3);
+  const visibleErrorMessage = errorMessage.replace(/^Request paused\.\s*/i, "");
 
   async function runAnalysis(overrideQuery = "") {
     if (isLoading) {
@@ -484,16 +491,28 @@ function App() {
   }
 
   function cancelVoiceAssistant() {
+    voiceSessionIdRef.current += 1;
     voiceCancelRef.current = true;
     stopSpeaking();
-    recognitionRef.current?.stop?.();
-    mediaRecorderRef.current?.stop?.();
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop?.();
+      } catch {}
+    }
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      try {
+        mediaRecorderRef.current.stop?.();
+      } catch {}
+    }
+
     mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
     mediaStreamRef.current = null;
     mediaRecorderRef.current = null;
     recognitionRef.current = null;
     audioChunksRef.current = [];
     finalTranscriptRef.current = "";
+    spokenQueryRef.current = "";
     setIsListening(false);
     setVoiceStatus("");
   }
@@ -628,12 +647,7 @@ function App() {
   }
 
   function stopVoiceCapture() {
-    voiceCancelRef.current = false;
-    recognitionRef.current?.stop?.();
-    mediaRecorderRef.current?.stop?.();
-    mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
-    mediaStreamRef.current = null;
-    setIsListening(false);
+    cancelVoiceAssistant();
   }
 
   function blobToBase64(blob) {
@@ -653,7 +667,13 @@ function App() {
       return false;
     }
 
+    const sessionId = voiceSessionIdRef.current + 1;
+    voiceSessionIdRef.current = sessionId;
     voiceCancelRef.current = false;
+    recognitionErrorRef.current = false;
+    finalTranscriptRef.current = "";
+    spokenQueryRef.current = "";
+    audioChunksRef.current = [];
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4";
     const recorder = new MediaRecorder(stream, { mimeType });
@@ -663,6 +683,10 @@ function App() {
     audioChunksRef.current = [];
 
     recorder.onstart = () => {
+      if (voiceSessionIdRef.current !== sessionId) {
+        return;
+      }
+
       setIsListening(true);
       setVoiceStatus("Listening... Ask your question now.");
       setErrorMessage("");
@@ -675,12 +699,21 @@ function App() {
     };
 
     recorder.onerror = () => {
+      if (voiceSessionIdRef.current !== sessionId) {
+        return;
+      }
+
       setIsListening(false);
       setVoiceStatus("");
       setErrorMessage("Voice capture did not complete. Please try again.");
     };
 
     recorder.onstop = async () => {
+      if (voiceSessionIdRef.current !== sessionId) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       setIsListening(false);
       mediaStreamRef.current?.getTracks?.().forEach((track) => track.stop());
       mediaStreamRef.current = null;
@@ -698,6 +731,7 @@ function App() {
 
       if (!audioBlob.size) {
         setVoiceStatus("");
+        setErrorMessage("I could not hear a full question. Please try again.");
         return;
       }
 
@@ -730,22 +764,52 @@ function App() {
     return true;
   }
 
-  function startBrowserRecognition() {
-    if (!hasSpeechRecognition) {
-      setErrorMessage("Voice assistant is not supported in this browser. Please try Chrome or Edge.");
-      return;
+  async function fallbackToPremiumVoiceCapture(nextStatus = "Switching to backup voice capture...") {
+    if (!canRecordAudio || voiceFallbackAttemptedRef.current) {
+      return false;
     }
 
+    voiceFallbackAttemptedRef.current = true;
+
+    try {
+      setVoiceStatus(nextStatus);
+      return await startPremiumVoiceCapture();
+    } catch (error) {
+      setVoiceStatus("");
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Voice capture did not complete. Please try again."
+      );
+      return false;
+    }
+  }
+
+  function startBrowserRecognition() {
+    if (!hasSpeechRecognition) {
+      return false;
+    }
+
+    const sessionId = voiceSessionIdRef.current + 1;
+    voiceSessionIdRef.current = sessionId;
     voiceCancelRef.current = false;
     stopSpeaking();
     finalTranscriptRef.current = "";
+    spokenQueryRef.current = "";
 
     const recognition = new SpeechRecognition();
     recognition.lang = "en-IN";
+    recognition.continuous = false;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
+      if (voiceSessionIdRef.current !== sessionId) {
+        return;
+      }
+
+      voiceFallbackAttemptedRef.current = false;
+      recognitionErrorRef.current = false;
       recognitionRef.current = recognition;
       setIsListening(true);
       setVoiceStatus("Listening... Ask your question now.");
@@ -753,6 +817,10 @@ function App() {
     };
 
     recognition.onresult = (event) => {
+      if (voiceSessionIdRef.current !== sessionId) {
+        return;
+      }
+
       let interim = "";
       let finalText = finalTranscriptRef.current;
 
@@ -767,24 +835,55 @@ function App() {
       }
 
       finalTranscriptRef.current = finalText;
-      setQuery(`${finalText}${interim}`.trim());
+      spokenQueryRef.current = `${finalText}${interim}`.trim();
+      setQuery(spokenQueryRef.current);
     };
 
     recognition.onerror = (event) => {
+      if (voiceSessionIdRef.current !== sessionId) {
+        return;
+      }
+
+      const spokenQuery = finalTranscriptRef.current.trim() || spokenQueryRef.current.trim();
+
       setIsListening(false);
       recognitionRef.current = null;
 
-      if (event.error === "not-allowed") {
+      if (event.error === "aborted") {
+        setVoiceStatus("");
+        return;
+      }
+
+      if (spokenQuery) {
+        recognitionErrorRef.current = false;
+        setVoiceStatus("Finalising your question...");
+        return;
+      }
+
+      recognitionErrorRef.current = true;
+
+      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
         setErrorMessage("Microphone access was blocked. Please allow microphone permission and try again.");
+      } else if (event.error === "audio-capture") {
+        void fallbackToPremiumVoiceCapture("Browser mic failed. Trying backup voice capture...");
+        return;
+      } else if (event.error === "no-speech") {
+        void fallbackToPremiumVoiceCapture("I didn't catch that. Trying backup voice capture...");
+        return;
       } else if (event.error !== "aborted") {
-        setErrorMessage("Voice capture did not complete. Please try speaking again.");
+        void fallbackToPremiumVoiceCapture("Voice capture was interrupted. Trying backup voice capture...");
+        return;
       }
 
       setVoiceStatus("");
     };
 
     recognition.onend = () => {
-      const spokenQuery = finalTranscriptRef.current.trim() || query.trim();
+      if (voiceSessionIdRef.current !== sessionId) {
+        return;
+      }
+
+      const spokenQuery = finalTranscriptRef.current.trim() || spokenQueryRef.current.trim();
 
       setIsListening(false);
       recognitionRef.current = null;
@@ -792,6 +891,13 @@ function App() {
       if (voiceCancelRef.current) {
         voiceCancelRef.current = false;
         finalTranscriptRef.current = "";
+        spokenQueryRef.current = "";
+        setVoiceStatus("");
+        return;
+      }
+
+      if (recognitionErrorRef.current) {
+        recognitionErrorRef.current = false;
         setVoiceStatus("");
         return;
       }
@@ -800,19 +906,50 @@ function App() {
         setVoiceStatus("Voice captured. Sending your request...");
         void runAnalysis(spokenQuery);
       } else {
-        setVoiceStatus("");
+        void fallbackToPremiumVoiceCapture("No speech detected. Trying backup voice capture...");
+        return;
       }
+
+      spokenQueryRef.current = "";
     };
 
-    recognition.start();
+    try {
+      recognition.start();
+      return true;
+    } catch (error) {
+      recognitionRef.current = null;
+      setIsListening(false);
+      setVoiceStatus("");
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : "Browser speech recognition could not start. Please try again."
+      );
+      return false;
+    }
   }
 
   async function startVoiceCapture() {
     setErrorMessage("");
-    stopSpeaking();
+    setWarningMessage("");
+    finalTranscriptRef.current = "";
+    spokenQueryRef.current = "";
+    audioChunksRef.current = [];
 
-    if (hasPremiumVoice) {
+    if (recognitionRef.current || mediaRecorderRef.current) {
+      cancelVoiceAssistant();
+    }
+
+    stopSpeaking();
+    voiceFallbackAttemptedRef.current = false;
+
+    if (startBrowserRecognition()) {
+      return;
+    }
+
+    if (canRecordAudio) {
       try {
+        setVoiceStatus("Starting fallback voice capture...");
         const started = await startPremiumVoiceCapture();
         if (started) {
           return;
@@ -821,17 +958,18 @@ function App() {
         setErrorMessage(
           error instanceof Error
             ? error.message
-            : "Microphone access was not available. Falling back to browser voice."
+            : "Microphone access was not available. Please try again."
         );
       }
     }
 
-    startBrowserRecognition();
+    setVoiceStatus("");
+    setErrorMessage("Voice capture is not available in this browser right now. Please allow mic access and try Chrome or Edge.");
   }
 
   function toggleVoiceAssistant() {
     if (isListening) {
-      stopVoiceCapture();
+      cancelVoiceAssistant();
       return;
     }
 
@@ -925,61 +1063,105 @@ function App() {
       </header>
 
       <section className="hero" aria-label="Hero section">
+        <div className="hero__particles" aria-hidden="true">
+          <span className="hero__particle hero__particle--1"></span>
+          <span className="hero__particle hero__particle--2"></span>
+          <span className="hero__particle hero__particle--3"></span>
+          <span className="hero__particle hero__particle--4"></span>
+          <span className="hero__particle hero__particle--5"></span>
+          <span className="hero__particle hero__particle--6"></span>
+        </div>
         <div className="hero__inner">
-          <div className="hero__eyebrow">
-            <span className="pulse-dot" aria-hidden="true"></span>
-            AI Feasibility Engine
-          </div>
+          <div className="hero__copy">
+            <div className="hero__eyebrow">
+              <span className="pulse-dot" aria-hidden="true"></span>
+              Craftech Voice Robot
+            </div>
 
-          <h1 className="hero__title">
-            Check <em>Feasibility</em>
-            <br />
-            <span className="hero__title-secondary">Unlock Ideas</span>
-          </h1>
+            <h1 className="hero__title">
+              AI CHAT <em>APP</em>
+            </h1>
 
-          <p className="hero__sub">
-            Ask anything about your project, event, or idea. Our AI, trained on Craftech
-            360&apos;s expertise across 17 cities and 800+ events, gives you real answers
-            instantly.
-          </p>
-
-          <div className="stats-strip" role="list" aria-label="Company statistics">
-            <div className="stat" role="listitem">
-              <span className="stat__num">{CONFIG.company.stats.events}</span>
-              <span className="stat__label">Events</span>
-            </div>
-            <div className="stat" role="listitem">
-              <span className="stat__num">{CONFIG.company.stats.cities}</span>
-              <span className="stat__label">Cities</span>
-            </div>
-            <div className="stat" role="listitem">
-              <span className="stat__num">{CONFIG.company.stats.countries}</span>
-              <span className="stat__label">Countries</span>
-            </div>
-            <div className="stat" role="listitem">
-              <span className="stat__num">{CONFIG.company.stats.reach}</span>
-              <span className="stat__label">Reached</span>
-            </div>
+            <p className="hero__sub">
+              A cleaner voice-first assistant with the bot in the spotlight and only the
+              most useful information around it.
+            </p>
           </div>
         </div>
       </section>
 
       <main className="main" id="mainContent">
-        <div className="main-layout">
-          {showAssistantDock && (
-            <aside className="assistant-sidebar" aria-hidden="true">
-              <div className={`assistant-sidebar__inner ${isSpeaking ? "assistant-sidebar__inner--speaking" : ""}`}>
-                <LipSyncAvatar
-                  mode={avatarMode}
-                  viseme={avatarViseme}
-                  subtitle={avatarSubtitle}
-                  theme={avatarTheme}
-                  compact
-                />
+        <div className="showcase-shell">
+          <div className="showcase-shell__center">
+            <div className={`voice-scene voice-scene--${avatarMode}`} aria-hidden="true">
+              <div className="voice-scene__floor"></div>
+              <div className="voice-scene__ring voice-scene__ring--outer"></div>
+              <div className="voice-scene__ring voice-scene__ring--mid"></div>
+              <div className="voice-scene__ring voice-scene__ring--inner"></div>
+              <div className="voice-scene__wave voice-scene__wave--back"></div>
+              <div className="voice-scene__wave voice-scene__wave--front"></div>
+              <div className="voice-scene__panel voice-scene__panel--left">
+                <span></span>
+                <span></span>
+                <span></span>
+                <div className="voice-scene__eq" aria-hidden="true">
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                </div>
               </div>
-            </aside>
-          )}
+              <div className="voice-scene__panel voice-scene__panel--center">
+                <span></span>
+                <span></span>
+                <span></span>
+                <span></span>
+                <div className="voice-scene__eq voice-scene__eq--wide" aria-hidden="true">
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                </div>
+              </div>
+              <div className="voice-scene__panel voice-scene__panel--right">
+                <span></span>
+                <span></span>
+                <span></span>
+                <div className="voice-scene__eq" aria-hidden="true">
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                  <i></i>
+                </div>
+              </div>
+              <div className="voice-scene__beam"></div>
+            </div>
+            <LipSyncAvatar
+              mode={avatarMode}
+              viseme={avatarViseme}
+              theme={avatarTheme}
+            />
 
+            <div className="showcase-info" aria-label="Assistant features">
+              <article className="showcase-info__item">
+                <span className="showcase-info__label">Fast</span>
+                <p>Voice-first feasibility answers in one place.</p>
+              </article>
+              <article className="showcase-info__item">
+                <span className="showcase-info__label">Focused</span>
+                <p>Only the bot, your prompt, and the result stay on screen.</p>
+              </article>
+              <article className="showcase-info__item">
+                <span className="showcase-info__label">Useful</span>
+                <p>Get feasibility, execution notes, risks, and idea prompts.</p>
+              </article>
+            </div>
+          </div>
+        </div>
+
+        <div className="main-layout">
           <div className="main-content">
         <div className="card input-card" id="inputCard">
           <div className="card__stripe" aria-hidden="true"></div>
@@ -1003,7 +1185,7 @@ function App() {
           {errorMessage && (
             <div className="status-banner status-banner--error" role="alert" aria-live="assertive">
               <div>
-                <strong>Request paused.</strong> {errorMessage}
+                <strong>Request paused.</strong> {visibleErrorMessage}
                 {retryAfterSeconds > 0 && ` Retry available in ${retryAfterSeconds}s.`}
               </div>
               <button
@@ -1032,7 +1214,7 @@ function App() {
                 <button
                   className="status-banner__action"
                   type="button"
-                  onClick={stopVoiceCapture}
+                  onClick={cancelVoiceAssistant}
                 >
                   Stop
                 </button>
@@ -1080,9 +1262,9 @@ function App() {
             </button>
           </form>
 
-          <span className="examples-label">Try an example -&gt;</span>
+          <span className="examples-label">Try an example</span>
           <div className="chip-group" role="list" aria-label="Example prompts">
-            {CONFIG.examples.map((example) => (
+            {showcaseExamples.map((example) => (
               <button
                 key={example}
                 className="chip"
@@ -1093,20 +1275,6 @@ function App() {
                 {example}
               </button>
             ))}
-          </div>
-
-          <div className="project-scout" aria-label="Similar company projects">
-            <div className="project-scout__header">
-              <span className="field-label project-scout__label">Similar Company Projects</span>
-            </div>
-            <div className="project-scout__grid">
-              {relatedProjects.map((project) => (
-                <article className="project-card" key={project.slug}>
-                  <h3 className="project-card__title">{project.title}</h3>
-                  <p className="project-card__summary">{project.summary}</p>
-                </article>
-              ))}
-            </div>
           </div>
         </div>
 
@@ -1266,43 +1434,12 @@ function App() {
           </section>
         )}
 
-        {history.length > 0 && (
-          <aside className="history-section" id="historySection" aria-label="Recent checks">
-            <h3 className="history-title">Recent Checks</h3>
-            <ul className="history-list" id="historyList">
-              {history.map((item, index) => (
-                <li key={`${item.query}-${index}`}>
-                  <button
-                    className="history-item"
-                    type="button"
-                    onClick={() => restoreHistoryItem(item)}
-                  >
-                    <div
-                      className="history-dot"
-                      style={{
-                        background:
-                          item.badge === "HIGH"
-                            ? "#00d4aa"
-                            : item.badge === "MEDIUM"
-                              ? "#ff6b2b"
-                              : "#ff6060",
-                      }}
-                    ></div>
-                    <span className="history-q">{item.query}</span>
-                    <span className="history-badge">{item.badge}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </aside>
-        )}
           </div>
         </div>
       </main>
 
       <footer className="footer">
-        Powered by <strong>Craftech 360</strong> | Bengaluru &amp; Mumbai | 17
-        Cities | 5 Countries
+        Powered by <strong>Craftech 360</strong>
       </footer>
 
       <button
